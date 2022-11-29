@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -433,7 +434,7 @@ func TestQuerier_Select(t *testing.T) {
 		equivalentQuery string
 
 		expected           []series
-		expectedAfterDedup series
+		expectedAfterDedup []series
 		expectedWarning    string
 	}{
 		{
@@ -466,11 +467,11 @@ func TestQuerier_Select(t *testing.T) {
 					samples: []sample{{100, 1}, {300, 3}},
 				},
 			},
-			expectedAfterDedup: series{
+			expectedAfterDedup: []series{{
 				lset: labels.Labels{},
 				// We don't expect correctness here, it's just random non-replica data.
 				samples: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}},
-			},
+			}},
 			expectedWarning: "partial error",
 		},
 		{
@@ -507,7 +508,7 @@ func TestQuerier_Select(t *testing.T) {
 					samples: expectedRealSeriesWithStaleMarkerReplica1,
 				},
 			},
-			expectedAfterDedup: series{
+			expectedAfterDedup: []series{{
 				lset: labels.FromStrings(
 					// No replica label anymore.
 					"__name__", "gitlab_transaction_cache_read_hit_count_total", "action", "widget.json", "controller", "Projects::MergeRequests::ContentController", "env", "gprd", "environment",
@@ -515,7 +516,7 @@ func TestQuerier_Select(t *testing.T) {
 					"gcp", "region", "us-east", "shard", "default", "stage", "main", "tier", "sv", "type", "web",
 				),
 				samples: expectedRealSeriesWithStaleMarkerDeduplicated,
-			},
+			}},
 		},
 		{
 			name: "realistic data with stale marker with 100000 step",
@@ -556,7 +557,7 @@ func TestQuerier_Select(t *testing.T) {
 					samples: expectedRealSeriesWithStaleMarkerReplica1,
 				},
 			},
-			expectedAfterDedup: series{
+			expectedAfterDedup: []series{{
 				lset: labels.FromStrings(
 					// No replica label anymore.
 					"__name__", "gitlab_transaction_cache_read_hit_count_total", "action", "widget.json", "controller", "Projects::MergeRequests::ContentController", "env", "gprd", "environment",
@@ -564,7 +565,7 @@ func TestQuerier_Select(t *testing.T) {
 					"gcp", "region", "us-east", "shard", "default", "stage", "main", "tier", "sv", "type", "web",
 				),
 				samples: expectedRealSeriesWithStaleMarkerDeduplicated,
-			},
+			}},
 		},
 		{
 			// Regression test against https://github.com/thanos-io/thanos/issues/2401.
@@ -608,13 +609,74 @@ func TestQuerier_Select(t *testing.T) {
 					samples: expectedRealSeriesWithStaleMarkerReplica1ForRate,
 				},
 			},
-			expectedAfterDedup: series{
+			expectedAfterDedup: []series{{
 				lset: labels.FromStrings(
 					"__name__", "gitlab_transaction_cache_read_hit_count_total", "action", "widget.json", "controller", "Projects::MergeRequests::ContentController", "env", "gprd", "environment",
 					"gprd", "fqdn", "web-08-sv-gprd.c.gitlab-production.internal", "instance", "web-08-sv-gprd.c.gitlab-production.internal:8083", "job", "gitlab-rails", "monitor", "app", "provider",
 					"gcp", "region", "us-east", "shard", "default", "stage", "main", "tier", "sv", "type", "web",
 				),
 				samples: expectedRealSeriesWithStaleMarkerDeduplicatedForRate,
+			}},
+		},
+		// Tests with proxy (integration test with store.ProxyStore).
+		{
+			name: "select with proxied sorted Store APIs",
+			storeAPI: newProxyStore([]storepb.StoreServer{
+				&testStoreServer{
+					resps: []*storepb.SeriesResponse{
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "1", "w", "1"), []sample{{0, 0}, {2, 1}, {3, 2}}),
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "1", "w", "1"), []sample{{5, 5}, {6, 6}, {7, 7}}),
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "1", "x", "1"), []sample{{2, 2}, {3, 3}, {4, 4}}, []sample{{1, 1}, {2, 2}, {3, 3}}),
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "1", "x", "1"), []sample{{100, 1}, {300, 3}, {400, 4}}),
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "2", "w", "1"), []sample{{5, 5}, {7, 7}}),
+					},
+				},
+				&testStoreServer{
+					resps: []*storepb.SeriesResponse{
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "2", "w", "1"), []sample{{2, 1}}),
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "2", "w", "1"), []sample{{5, 5}, {6, 6}, {7, 7}}),
+						storeSeriesResponse(t, labels.FromStrings("a", "1", "r", "2", "x", "2"), []sample{{10, 10}, {30, 30}, {40, 40}}),
+					},
+				},
+			}),
+			mint: 1, maxt: 300,
+			replicaLabels:   []string{"r"},
+			equivalentQuery: `{a=~"1"}`,
+			matchers:        []*labels.Matcher{{Name: "a", Value: "1", Type: labels.MatchRegexp}},
+			expected: []series{
+				{
+					lset:    labels.FromStrings("a", "1", "r", "1", "w", "1"),
+					samples: []sample{{2, 1}, {3, 2}, {5, 5}, {6, 6}, {7, 7}},
+				},
+				{
+					lset:    labels.FromStrings("a", "1", "r", "1", "x", "1"),
+					samples: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}, {100, 1}, {300, 3}},
+				},
+				{
+					lset:    labels.FromStrings("a", "1", "r", "2", "w", "1"),
+					samples: []sample{{2, 1}, {5, 5}, {6, 6}, {7, 7}},
+				},
+				{
+					lset:    labels.FromStrings("a", "1", "r", "2", "x", "2"),
+					samples: []sample{{10, 10}, {30, 30}, {40, 40}},
+				},
+			},
+			expectedAfterDedup: []series{
+				{
+					lset: labels.FromStrings("a", "1", "w", "1"),
+					// We don't expect correctness here, it's just random non-replica data.
+					samples: []sample{{2, 1}, {3, 2}, {5, 5}, {6, 6}, {7, 7}},
+				},
+				{
+					lset: labels.FromStrings("a", "1", "x", "1"),
+					// We don't expect correctness here, it's just random non-replica data.
+					samples: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}, {100, 1}, {300, 3}},
+				},
+				{
+					lset: labels.FromStrings("a", "1", "x", "2"),
+					// We don't expect correctness here, it's just random non-replica data.
+					samples: []sample{{10, 10}, {30, 30}, {40, 40}},
+				},
 			},
 		},
 	} {
@@ -631,7 +693,7 @@ func TestQuerier_Select(t *testing.T) {
 				expected []series
 			}{
 				{dedup: false, expected: tcase.expected},
-				{dedup: true, expected: []series{tcase.expectedAfterDedup}},
+				{dedup: true, expected: tcase.expectedAfterDedup},
 			} {
 				g := gate.New(2)
 				q := newQuerier(context.Background(), nil, tcase.mint, tcase.maxt, tcase.replicaLabels, nil, tcase.storeAPI, sc.dedup, 0, true, false, false, g, timeout, nil, func(i storepb.SeriesStatsCounter) {})
@@ -677,6 +739,23 @@ func TestQuerier_Select(t *testing.T) {
 	}
 }
 
+func newProxyStore(storeAPIs []storepb.StoreServer) *store.ProxyStore {
+	cls := make([]store.Client, len(storeAPIs))
+	for i, s := range storeAPIs {
+		cls[i] = &testClient{Name: fmt.Sprintf("%v", i), StoreClient: storepb.ServerAsClient(s, 0), Mint: math.MinInt64, Maxt: math.MaxInt64}
+	}
+
+	return store.NewProxyStore(
+		nil,
+		nil,
+		func() []store.Client { return cls },
+		component.Query,
+		nil,
+		0,
+		store.EagerRetrieval,
+	)
+}
+
 func testSelectResponse(t *testing.T, expected []series, res storage.SeriesSet) {
 	var series []storage.Series
 	// Use it as PromQL would do, first gather all series.
@@ -684,7 +763,13 @@ func testSelectResponse(t *testing.T, expected []series, res storage.SeriesSet) 
 		series = append(series, res.At())
 	}
 	testutil.Ok(t, res.Err())
-	testutil.Equals(t, len(expected), len(series))
+	testutil.Equals(t, len(expected), len(series), "got %v", func() string {
+		var ret []string
+		for _, s := range series {
+			ret = append(ret, s.Labels().String())
+		}
+		return strings.Join(ret, ",")
+	}())
 
 	for i, s := range series {
 		testutil.Equals(t, expected[i].lset, s.Labels())
@@ -699,7 +784,7 @@ func testSelectResponse(t *testing.T, expected []series, res storage.SeriesSet) 
 			}
 			expectedCpy = append(expectedCpy, sample{t: s.t, v: v})
 		}
-		testutil.Equals(t, expectedCpy, samples, "samples for series %v does not match", i)
+		testutil.Equals(t, expectedCpy, samples, "samples for series %v does not match", s.Labels())
 	}
 }
 

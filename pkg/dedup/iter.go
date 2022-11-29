@@ -36,6 +36,9 @@ func isCounter(f string) bool {
 	return f == "increase" || f == "rate" || f == "irate" || f == "resets"
 }
 
+// NewSeriesSet returns seriesSet that deduplicates series the same series (without given replica labels).
+// The series in series set are expected to be sorted WITHOUT given replica labels. This also means any potential replica labels
+// are at the end of the series labels (in any order).
 func NewSeriesSet(set storage.SeriesSet, replicaLabels map[string]struct{}, f string, pushdownEnabled bool) storage.SeriesSet {
 	// TODO: remove dependency on knowing whether it is a counter.
 	s := &dedupSeriesSet{pushdownEnabled: pushdownEnabled, set: set, replicaLabels: replicaLabels, isCounter: isCounter(f), f: f}
